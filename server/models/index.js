@@ -1,0 +1,15 @@
+module.exports = {
+  User: require('./User'),
+  Student: require('./Student'),
+  Teacher: require('./Teacher'),
+  Admin: require('./Admin'),
+  Department: require('./Department'),
+  Class: require('./Class'),
+  Schedule: require('./Schedule'),
+  AttendanceLog: require('./AttendanceLog'),
+  PeriodwiseAttendanceLog: require('./PeriodwiseAttendanceLog'),
+  Assignment: require('./Assignment'),
+  Announcement: require('./Announcement'),
+  RecognitionLog: require('./RecognitionLog'),
+  AttendanceCorrection: require('./AttendanceCorrection'),
+};

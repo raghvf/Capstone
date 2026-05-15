@@ -5,6 +5,7 @@ Requires: opencv-contrib-python (provides cv2.face / LBPH).
 """
 import base64
 import os
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -13,12 +14,14 @@ from flask_cors import CORS
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FACES_DIR = os.path.join(ROOT, "faces")
+LOGS_DIR = os.path.join(ROOT, "recognition_logs")
 
 app = Flask(__name__)
 CORS(app)
 
-# LBPH: lower confidence = better match. Values > ~70–80 are usually wrong / unknown.
-CONFIDENCE_UNKNOWN_THRESHOLD = 78.0
+CONFIDENCE_UNKNOWN_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "78.0"))
+MIN_ENROLLMENT_IMAGES = int(os.getenv("MIN_ENROLLMENT_IMAGES", "3"))
+MAX_ENROLLMENT_IMAGES = int(os.getenv("MAX_ENROLLMENT_IMAGES", "20"))
 
 _recognizer_cache = None
 _label_reverse_map_cache = None
@@ -49,8 +52,37 @@ def _decode_image_bgr(image_data: str):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
+def _preprocess_face(gray_face):
+    """Normalize lighting and resize for consistent LBPH recognition."""
+    face = cv2.resize(gray_face, (200, 200))
+    face = cv2.equalizeHist(face)
+    return face
+
+
+def _detect_faces(gray, face_cascade):
+    return face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=6,
+        minSize=(80, 80),
+    )
+
+
+def _log_recognition(usn, confidence, status, faces_detected=0, extra=None):
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_file = os.path.join(LOGS_DIR, f"log_{datetime.now().strftime('%Y%m%d')}.txt")
+    line = (
+        f"{datetime.now().isoformat()} | status={status} | usn={usn} | "
+        f"confidence={confidence} | faces={faces_detected}"
+    )
+    if extra:
+        line += f" | {extra}"
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 def train_model():
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer = cv2.face.LBPHFaceRecognizer_create(1, 8, 8, 8)
     faces = []
     labels = []
     label_map = {}
@@ -76,7 +108,7 @@ def train_model():
             if img is None:
                 print(f"[WARN] Could not read image: {img_path}")
                 continue
-            faces.append(img)
+            faces.append(_preprocess_face(img))
             labels.append(label_map[person_usn])
 
     if len(faces) == 0:
@@ -100,10 +132,15 @@ def get_recognizer():
     return _recognizer_cache, _label_reverse_map_cache
 
 
+def invalidate_cache():
+    global _faces_mtime_cache
+    _faces_mtime_cache = None
+
+
 @app.route("/enroll", methods=["POST"])
 def enroll():
     data = request.get_json(silent=True) or {}
-    usn = data.get("usn")
+    usn = str(data.get("usn", "")).strip().upper()
     image_data = data.get("image")
 
     if not usn or not image_data:
@@ -123,28 +160,46 @@ def enroll():
     if face_cascade.empty():
         return jsonify({"message": "Face detector failed to load"}), 500
 
-    detected = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    detected = _detect_faces(gray, face_cascade)
     if len(detected) == 0:
-        return jsonify({"message": "No face detected"}), 400
+        return jsonify({"message": "No face detected. Ensure good lighting and face the camera."}), 400
 
-    student_folder = os.path.join(FACES_DIR, str(usn))
+    if len(detected) > 1:
+        return jsonify({
+            "message": "Multiple faces detected. Only one person should be in frame.",
+            "faces_detected": len(detected),
+        }), 400
+
+    student_folder = os.path.join(FACES_DIR, usn)
     os.makedirs(student_folder, exist_ok=True)
 
-    count = len(
-        [f for f in os.listdir(student_folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-    )
+    existing = [
+        f for f in os.listdir(student_folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    ]
+    if len(existing) >= MAX_ENROLLMENT_IMAGES:
+        return jsonify({
+            "message": f"Maximum {MAX_ENROLLMENT_IMAGES} enrollment images reached for {usn}",
+            "image_count": len(existing),
+        }), 400
+
     saved = 0
     for (x, y, w, h) in detected:
-        face = gray[y : y + h, x : x + w]
-        count += 1
+        face = _preprocess_face(gray[y : y + h, x : x + w])
+        count = len(existing) + saved + 1
         filename = os.path.join(student_folder, f"{usn}_{count}.jpg")
         cv2.imwrite(filename, face)
         saved += 1
 
-    global _faces_mtime_cache
-    _faces_mtime_cache = None
+    invalidate_cache()
+    total_images = len(existing) + saved
 
-    return jsonify({"message": f"Enrollment complete ({saved} face image(s) saved)"}), 200
+    return jsonify({
+        "message": f"Enrollment complete ({saved} face image(s) saved)",
+        "usn": usn,
+        "image_count": total_images,
+        "enrollment_valid": total_images >= MIN_ENROLLMENT_IMAGES,
+        "min_required": MIN_ENROLLMENT_IMAGES,
+    }), 200
 
 
 @app.route("/recognize", methods=["POST"])
@@ -153,48 +208,112 @@ def recognize():
     image_data = data.get("image")
 
     if not image_data:
-        return jsonify({"usn": "No image", "confidence": None}), 400
+        _log_recognition(None, None, "no_image")
+        return jsonify({"usn": "No image", "confidence": None, "status": "no_image"}), 400
 
     try:
         frame = _decode_image_bgr(image_data)
     except Exception:
-        return jsonify({"usn": "Invalid image", "confidence": None}), 400
+        _log_recognition(None, None, "invalid_image")
+        return jsonify({"usn": "Invalid image", "confidence": None, "status": "error"}), 400
 
     if frame is None:
-        return jsonify({"usn": "Invalid image", "confidence": None}), 400
+        return jsonify({"usn": "Invalid image", "confidence": None, "status": "error"}), 400
 
     try:
         recognizer, label_reverse_map = get_recognizer()
     except ValueError as e:
-        return jsonify({"usn": str(e), "confidence": None}), 400
+        return jsonify({"usn": str(e), "confidence": None, "status": "error"}), 400
 
     cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
     face_cascade = cv2.CascadeClassifier(cascade_path)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    faces = _detect_faces(gray, face_cascade)
 
     if len(faces) == 0:
-        return jsonify({"usn": "No face detected", "confidence": None})
+        _log_recognition(None, None, "no_face", faces_detected=0)
+        return jsonify({
+            "usn": "No face detected",
+            "confidence": None,
+            "status": "no_face",
+            "faces_detected": 0,
+        })
 
+    results = []
     for (x, y, w, h) in faces:
-        face_img = gray[y : y + h, x : x + w]
+        face_img = _preprocess_face(gray[y : y + h, x : x + w])
         label, confidence = recognizer.predict(face_img)
         usn = label_reverse_map.get(label, "Unknown")
+        status = "recognized"
+
         if confidence > CONFIDENCE_UNKNOWN_THRESHOLD:
             usn = "Unknown"
-        return jsonify({"usn": usn, "confidence": float(confidence)})
+            status = "unknown"
 
-    return jsonify({"usn": "No face detected", "confidence": None})
+        _log_recognition(usn, float(confidence), status, faces_detected=len(faces))
+        results.append({
+            "usn": usn,
+            "confidence": float(confidence),
+            "status": status,
+        })
+
+    primary = results[0]
+    return jsonify({
+        "usn": primary["usn"],
+        "confidence": primary["confidence"],
+        "status": primary["status"],
+        "faces_detected": len(faces),
+        "all_results": results,
+    })
+
+
+@app.route("/enrollment-status/<usn>", methods=["GET"])
+def enrollment_status(usn):
+    usn = usn.upper()
+    folder = os.path.join(FACES_DIR, usn)
+    if not os.path.isdir(folder):
+        return jsonify({"usn": usn, "enrolled": False, "image_count": 0})
+
+    count = len([f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    return jsonify({
+        "usn": usn,
+        "enrolled": count > 0,
+        "image_count": count,
+        "enrollment_valid": count >= MIN_ENROLLMENT_IMAGES,
+        "min_required": MIN_ENROLLMENT_IMAGES,
+    })
+
+
+@app.route("/retrain", methods=["POST"])
+def retrain():
+    try:
+        invalidate_cache()
+        get_recognizer()
+        return jsonify({"message": "Model retrained successfully"}), 200
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
 
 
 @app.route("/health", methods=["GET"])
 def health():
     ok = os.path.isdir(FACES_DIR) and bool(os.listdir(FACES_DIR))
-    return jsonify({"ok": True, "has_enrollments": ok, "cv2_face": hasattr(cv2, "face")})
+    enrolled_count = 0
+    if os.path.isdir(FACES_DIR):
+        enrolled_count = len([d for d in os.listdir(FACES_DIR) if os.path.isdir(os.path.join(FACES_DIR, d))])
+    return jsonify({
+        "ok": True,
+        "has_enrollments": ok,
+        "enrolled_students": enrolled_count,
+        "cv2_face": hasattr(cv2, "face"),
+        "confidence_threshold": CONFIDENCE_UNKNOWN_THRESHOLD,
+    })
 
 
 if __name__ == "__main__":
     os.makedirs(FACES_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    host = os.getenv("FACE_API_HOST", "127.0.0.1")
+    port = int(os.getenv("FACE_API_PORT", "5000"))
     print(f"[face-api] faces directory: {FACES_DIR}")
     print(f"[face-api] cv2.face available: {hasattr(cv2, 'face')}")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=host, port=port, debug=False)

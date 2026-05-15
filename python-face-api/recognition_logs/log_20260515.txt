@@ -1,0 +1,9 @@
+2026-05-15T18:36:23.578459 | status=recognized | usn=usn | confidence=72.64673139375208 | faces=1
+2026-05-15T18:43:58.748482 | status=recognized | usn=usn | confidence=60.17561771361426 | faces=1
+2026-05-15T18:44:11.011037 | status=no_face | usn=None | confidence=None | faces=0
+2026-05-15T18:44:41.079876 | status=recognized | usn=usn | confidence=53.00548722809049 | faces=1
+2026-05-15T23:32:01.752743 | status=recognized | usn=1CR20CS002 | confidence=42.80471610867673 | faces=1
+2026-05-15T23:32:22.533173 | status=recognized | usn=1CR20CS002 | confidence=50.248879276417426 | faces=1
+2026-05-15T23:33:03.109794 | status=recognized | usn=1CR20CS002 | confidence=58.680446292925694 | faces=1
+2026-05-15T23:33:09.617359 | status=recognized | usn=1CR20CS002 | confidence=50.50025242729784 | faces=1
+2026-05-15T23:35:07.505865 | status=recognized | usn=1CR20CS002 | confidence=52.18130035841409 | faces=1
